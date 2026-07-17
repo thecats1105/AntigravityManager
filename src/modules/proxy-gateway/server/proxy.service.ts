@@ -17,6 +17,7 @@ import {
   ClaudeResponse,
   GeminiInternalRequest,
   GeminiPart as InternalGeminiPart,
+  Tool,
 } from '../antigravity/types';
 import { normalizeObjectJsonSchema } from '../antigravity/JsonSchemaUtils';
 import { classifyStreamError } from '../antigravity/stream-error-utils';
@@ -189,13 +190,10 @@ export class ProxyService {
       );
 
       try {
+        const claudeRequest = this.toClaudeRequest(request);
         const projectId = token.token.project_id ?? '';
         const requestUserAgent = await resolveRequestUserAgent();
-        const geminiBody = transformClaudeRequestIn(
-          this.toClaudeRequest(request),
-          projectId,
-          requestUserAgent,
-        );
+        const geminiBody = transformClaudeRequestIn(claudeRequest, projectId, requestUserAgent);
         geminiBody.model = effectiveTargetModel;
         this.applyInternalGenerationConstraints(geminiBody, effectiveTargetModel, token.id);
 
@@ -206,7 +204,7 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
           );
-          return this.processAnthropicInternalStream(stream, geminiBody.model);
+          return this.processAnthropicInternalStream(stream, geminiBody.model, claudeRequest.tools);
         } else {
           const response = await this.generateInternalWithStreamFallback(
             geminiBody,
@@ -214,6 +212,7 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
           );
+          this.coerceGeminiResponse(response, claudeRequest.tools);
           return this.toAnthropicChatResponse(transformResponse(response));
         }
       } catch (error) {
@@ -222,12 +221,9 @@ export class ProxyService {
             `Anthropic request hit project context issue, retrying without project: ${error.message}`,
           );
           try {
+            const claudeRequest = this.toClaudeRequest(request);
             const requestUserAgent = await resolveRequestUserAgent();
-            const fallbackBody = transformClaudeRequestIn(
-              this.toClaudeRequest(request),
-              '',
-              requestUserAgent,
-            );
+            const fallbackBody = transformClaudeRequestIn(claudeRequest, '', requestUserAgent);
             fallbackBody.model = effectiveTargetModel;
             this.applyInternalGenerationConstraints(fallbackBody, effectiveTargetModel, token.id);
             if (request.stream) {
@@ -237,7 +233,11 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
-              return this.processAnthropicInternalStream(stream, fallbackBody.model);
+              return this.processAnthropicInternalStream(
+                stream,
+                fallbackBody.model,
+                claudeRequest.tools,
+              );
             } else {
               const response = await this.generateInternalWithStreamFallback(
                 fallbackBody,
@@ -245,6 +245,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.coerceGeminiResponse(response, claudeRequest.tools);
               return this.toAnthropicChatResponse(transformResponse(response));
             }
           } catch (fallbackErr) {
@@ -275,7 +276,11 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
-              return this.processAnthropicInternalStream(stream, downgradedBody.model);
+              return this.processAnthropicInternalStream(
+                stream,
+                downgradedBody.model,
+                downgradedRequest.tools,
+              );
             } else {
               const response = await this.generateInternalWithStreamFallback(
                 downgradedBody,
@@ -283,6 +288,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.coerceGeminiResponse(response, downgradedRequest.tools);
               const transformed = this.toAnthropicChatResponse(transformResponse(response));
               return {
                 ...transformed,
@@ -307,6 +313,7 @@ export class ProxyService {
   private processAnthropicInternalStream(
     upstreamStream: NodeJS.ReadableStream,
     _model: string,
+    tools?: Tool[],
   ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
@@ -340,7 +347,10 @@ export class ProxyService {
           if (dataStr === '[DONE]') continue;
 
           try {
-            const json = JSON.parse(dataStr);
+            let json = JSON.parse(dataStr);
+            if (json && typeof json === 'object' && 'response' in json) {
+              json = json.response;
+            }
 
             if (json) {
               const startMsg = state.emitMessageStart(json);
@@ -358,6 +368,7 @@ export class ProxyService {
             }
 
             if (this.isGeminiPart(part)) {
+              this.coerceGeminiPart(part, tools);
               const chunks = processor.process(part);
               chunks.forEach((c) => subscriber.next(c));
             }
@@ -746,7 +757,12 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
-            return this.createOpenAIProtocolStream(stream, request.model, outputProtocol);
+            return this.createOpenAIProtocolStream(
+              stream,
+              request.model,
+              outputProtocol,
+              claudeRequest.tools,
+            );
           } catch (streamError) {
             this.logger.warn(
               `Stream path failed for model=${request.model}; falling back to non-stream generation: ${
@@ -763,6 +779,7 @@ export class ProxyService {
             this.logger.log(
               `Upstream response snippet after stream fallback: ${JSON.stringify(response).substring(0, 500)}`,
             );
+            this.coerceGeminiResponse(response, claudeRequest.tools);
             const claudeResponse = transformResponse(response);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -782,6 +799,7 @@ export class ProxyService {
           this.logger.log(
             `Upstream response snippet (non-stream): ${JSON.stringify(response).substring(0, 500)}`,
           );
+          this.coerceGeminiResponse(response, claudeRequest.tools);
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response);
           this.logger.log(
@@ -807,7 +825,12 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
-              return this.createOpenAIProtocolStream(stream, request.model, outputProtocol);
+              return this.createOpenAIProtocolStream(
+                stream,
+                request.model,
+                outputProtocol,
+                claudeRequest.tools,
+              );
             }
 
             const response = await this.generateInternalWithStreamFallback(
@@ -816,6 +839,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
+            this.coerceGeminiResponse(response, claudeRequest.tools);
             const claudeResponse = transformResponse(response);
             return this.convertClaudeToOpenAIResponse(claudeResponse, request.model);
           } catch (fallbackErr) {
@@ -959,16 +983,18 @@ export class ProxyService {
     upstreamStream: NodeJS.ReadableStream,
     model: string,
     outputProtocol: OpenAIOutputProtocol,
+    tools?: Tool[],
   ): Observable<string> {
     if (outputProtocol === 'responses') {
-      return this.processResponsesStreamResponse(upstreamStream, model);
+      return this.processResponsesStreamResponse(upstreamStream, model, tools);
     }
-    return this.processStreamResponse(upstreamStream, model);
+    return this.processStreamResponse(upstreamStream, model, tools);
   }
 
   private processResponsesStreamResponse(
     upstreamStream: NodeJS.ReadableStream,
     model: string,
+    tools?: Tool[],
   ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
@@ -1005,7 +1031,11 @@ export class ProxyService {
           subscriber.next(': ping\n\n');
         }
       }, 15_000);
-      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'OpenAI-Responses-SSE', complete);
+      const idleTimer = this.createStreamIdleTimer(
+        upstreamStream,
+        'OpenAI-Responses-SSE',
+        complete,
+      );
       idleTimer.reset();
 
       upstreamStream.on('data', (chunk: Buffer) => {
@@ -1042,6 +1072,7 @@ export class ProxyService {
             const parts = content?.parts;
             if (Array.isArray(parts)) {
               for (const part of parts) {
+                this.coerceGeminiPart(part, tools);
                 const normalizedPart = this.toResponsesStreamPart(part);
                 if (!normalizedPart) {
                   continue;
@@ -1077,7 +1108,8 @@ export class ProxyService {
       upstreamStream.on('error', (error: unknown) => {
         idleTimer.clear();
         clearHeartbeat();
-        const cleanError = error instanceof Error ? new Error(error.message) : new Error(String(error));
+        const cleanError =
+          error instanceof Error ? new Error(error.message) : new Error(String(error));
         this.logger.error(`OpenAI Responses stream error: ${cleanError.message}`);
         subscriber.error(cleanError);
       });
@@ -1167,6 +1199,7 @@ export class ProxyService {
   private processStreamResponse(
     upstreamStream: NodeJS.ReadableStream,
     model: string,
+    tools?: Tool[],
   ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
@@ -1196,6 +1229,9 @@ export class ProxyService {
       idleTimer.reset();
 
       upstreamStream.on('data', (chunk: Buffer) => {
+        this.logger.log(
+          `[Stream Debug] Received chunk (length=${chunk.length}): ${chunk.toString().slice(0, 500)}`,
+        );
         idleTimer.reset();
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split('\n');
@@ -1209,7 +1245,10 @@ export class ProxyService {
           if (dataStr === '[DONE]') continue;
 
           try {
-            const json = JSON.parse(dataStr);
+            let json = JSON.parse(dataStr);
+            if (json && typeof json === 'object' && 'response' in json) {
+              json = json.response;
+            }
             const candidate = json.candidates?.[0];
             const parts = candidate?.content?.parts || [];
 
@@ -1233,6 +1272,7 @@ export class ProxyService {
               }
 
               if (part.functionCall) {
+                this.coerceGeminiPart(part, tools);
                 const toolCallChunk = {
                   id: streamId,
                   object: 'chat.completion.chunk',
@@ -1328,7 +1368,16 @@ export class ProxyService {
         }
       });
 
+      upstreamStream.on('error', (err) => {
+        this.logger.error(`[Stream Debug] Upstream stream error:`, err);
+      });
+
+      upstreamStream.on('close', () => {
+        this.logger.log(`[Stream Debug] Upstream stream closed`);
+      });
+
       upstreamStream.on('end', () => {
+        this.logger.log(`[Stream Debug] Upstream stream ended`);
         idleTimer.clear();
         if (!hasEmittedChunk) {
           pushChunk({
@@ -1910,5 +1959,87 @@ export class ProxyService {
 
   private isGeminiPart(value: unknown): value is InternalGeminiPart {
     return isPlainObject(value);
+  }
+
+  private coerceGeminiResponse(response: GeminiResponse, tools?: Tool[]): void {
+    if (!response || !Array.isArray(response.candidates) || !tools || tools.length === 0) {
+      return;
+    }
+    for (const candidate of response.candidates) {
+      const parts = candidate?.content?.parts;
+      if (Array.isArray(parts)) {
+        for (const part of parts) {
+          this.coerceGeminiPart(part, tools);
+        }
+      }
+    }
+  }
+
+  private coerceGeminiPart(part: any, tools?: Tool[]): void {
+    if (!part || !part.functionCall || !tools || tools.length === 0) {
+      return;
+    }
+    const toolName = part.functionCall.name;
+    if (!toolName) {
+      return;
+    }
+    const tool = tools.find((t) => t.name === toolName);
+    if (tool && tool.input_schema && part.functionCall.args) {
+      this.coerceObject(part.functionCall.args, tool.input_schema);
+    }
+  }
+
+  private coerceObject(input: Record<string, unknown>, schema: any): void {
+    if (!schema || typeof schema !== 'object') {
+      return;
+    }
+    if (schema.type === 'object' && schema.properties) {
+      for (const [key, propSchema] of Object.entries<any>(schema.properties)) {
+        if (key in input) {
+          const val = input[key];
+          if (propSchema && typeof propSchema === 'object') {
+            if (
+              propSchema.type === 'object' &&
+              val &&
+              typeof val === 'object' &&
+              !Array.isArray(val)
+            ) {
+              this.coerceObject(val as Record<string, unknown>, propSchema);
+            } else {
+              input[key] = this.coerceValue(val, propSchema);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private coerceValue(value: unknown, propSchema: any): unknown {
+    if (value === null || value === undefined) {
+      return value;
+    }
+    const type = typeof value;
+    const targetType = typeof propSchema.type === 'string' ? propSchema.type.toLowerCase() : null;
+
+    if (targetType === 'integer' || targetType === 'number') {
+      if (type === 'string') {
+        const strVal = (value as string).trim();
+        const num = Number(strVal);
+        if (!isNaN(num) && strVal !== '') {
+          return targetType === 'integer' ? Math.floor(num) : num;
+        }
+      }
+    } else if (targetType === 'boolean') {
+      if (type === 'string') {
+        const strVal = (value as string).trim().toLowerCase();
+        if (strVal === 'true') return true;
+        if (strVal === 'false') return false;
+      } else if (type === 'number') {
+        return value !== 0;
+      }
+    } else if (targetType === 'array' && Array.isArray(value) && propSchema.items) {
+      return value.map((item) => this.coerceValue(item, propSchema.items));
+    }
+    return value;
   }
 }

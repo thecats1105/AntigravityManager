@@ -115,6 +115,20 @@ function cleanJsonSchemaRecursive(value: any) {
   } else {
     const map = value;
 
+    if (isArray(map.enum)) {
+      map.enum = map.enum
+        .map((item: unknown) => {
+          if (item === null || item === undefined) {
+            return '';
+          }
+          return String(item).trim();
+        })
+        .filter((item: string) => item.length > 0);
+      if (map.enum.length === 0) {
+        delete map.enum;
+      }
+    }
+
     if (isObjectLike(map.properties) && !isArray(map.properties)) {
       const properties = map.properties as Record<string, unknown>;
       const droppedKeys = Object.keys(properties).filter(
